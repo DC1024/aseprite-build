@@ -2,42 +2,102 @@ name: build-auto
 on:
   push:
     paths:
-    - '.github/workflows/build-auto.yml'
-    - 'build.sh'
-    - 'laf'
+      - '.github/workflows/build-auto.yml'
+      - 'build.sh'
+      - 'laf/**'  # 修改为目录规范匹配
 jobs:
   build-auto:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # 使用固定系统版本避免未来标签迁移问题
+        os: [windows-2022, macos-13, ubuntu-22.04]
         build_type: [RelWithDebInfo, Debug]
+        include:
+          # 添加平台显示名称用于产物命名
+          - os: windows-2022
+            display_name: windows
+          - os: macos-13
+            display_name: macos
+          - os: ubuntu-22.04
+            display_name: linux
+    
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: 'recursive'
+    
+    # 依赖安装（优化为多平台支持）
     - name: Install Dependencies
-      if: runner.os == 'Linux'
       shell: bash
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y \
-          libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
-          libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+        if [[ "${{ runner.os }}" == "Linux" ]]; then
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+        elif [[ "${{ runner.os }}" == "macOS" ]]; then
+          brew install pixman freetype harfbuzz
+        fi
+    
     - uses: aseprite/get-ninja@main
+    
     - uses: ilammy/msvc-dev-cmd@v1
       if: runner.os == 'Windows'
+    
+    # 添加缓存步骤加速后续构建
+    - name: Cache build artifacts
+      uses: actions/cache@v3
+      with:
+        path: |
+          build/**
+          laf/build/**
+          !build/bin/**  # 不缓存最终二进制
+        key: ${{ runner.os }}-${{ matrix.build_type }}-${{ hashFiles('build.sh', 'laf/CMakeLists.txt') }}
+    
+    # 构建步骤（添加构建目录参数）
     - name: Building
       shell: bash
       run: |
-        bash build.sh --auto --norun
+        bash build.sh --auto --norun --build-dir build_${{ matrix.build_type }}
+    
+    # 运行测试（优化为全平台支持）
     - name: Running CLI Tests
       shell: bash
       run: |
-        if [[ "${{ runner.os }}" == "Linux" ]] ; then
-          export XVFB=xvfb-run
+        BUILD_DIR=build_${{ matrix.build_type }}
+        export ASEPRITE=$PWD/$BUILD_DIR/bin/aseprite
+        
+        # Windows需要添加.exe后缀
+        if [[ "${{ runner.os }}" == "Windows" ]]; then
+          export ASEPRITE="$ASEPRITE.exe"
         fi
-        export ASEPRITE=$PWD/build/bin/aseprite
+        
         cd tests
-        $XVFB bash run-tests.sh
+        if [[ "${{ runner.os }}" != "Windows" ]]; then
+          xvfb-run bash run-tests.sh
+        else
+          bash run-tests.sh
+        fi
+    
+    # === 新增：上传构建产物 ===
+    - name: Upload Release Build
+      if: matrix.build_type == 'RelWithDebInfo'
+      uses: actions/upload-artifact@v4
+      with:
+        name: asepprite-${{ matrix.display_name }}-release
+        path: |
+          build_${{ matrix.build_type }}/bin/*
+          licenses/**
+        retention-days: 7
+    
+    - name: Upload Debug Build
+      if: matrix.build_type == 'Debug'
+      uses: actions/upload-artifact@v4
+      with:
+        name: asepprite-${{ matrix.display_name }}-debug
+        path: |
+          build_${{ matrix.build_type }}/bin/*
+          symbols/**
+        retention-days: 3  # 调试版本保留时间较短
